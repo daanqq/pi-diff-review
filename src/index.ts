@@ -1,5 +1,5 @@
-import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
-import { Key, matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { open, type GlimpseWindow } from "glimpseui";
 import { getReviewWindowData, loadReviewFileContents } from "./git.js";
 import { composeReviewPrompt } from "./prompt.js";
@@ -117,13 +117,13 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const { repoRoot, files } = await getReviewWindowData(pi, ctx.cwd);
+    const { repoRoot, files, commits } = await getReviewWindowData(pi, ctx.cwd);
     if (files.length === 0) {
       ctx.ui.notify("No reviewable files found.", "info");
       return;
     }
 
-    const html = buildReviewHtml({ repoRoot, files });
+    const html = buildReviewHtml({ repoRoot, files, commits });
     const window = open(html, {
       width: 1680,
       height: 1020,
@@ -141,12 +141,12 @@ export default function (pi: ExtensionAPI) {
       window.send(`window.__reviewReceive(${payload});`);
     };
 
-    const loadContents = (file: ReviewFile, scope: ReviewRequestFilePayload["scope"]): Promise<ReviewFileContents> => {
-      const cacheKey = `${scope}:${file.id}`;
+    const loadContents = (file: ReviewFile, scope: ReviewRequestFilePayload["scope"], commitSha?: string): Promise<ReviewFileContents> => {
+      const cacheKey = `${scope}:${commitSha ?? ""}:${file.id}`;
       const cached = contentCache.get(cacheKey);
       if (cached != null) return cached;
 
-      const pending = loadReviewFileContents(pi, repoRoot, file, scope);
+      const pending = loadReviewFileContents(pi, repoRoot, file, scope, commitSha);
       contentCache.set(cacheKey, pending);
       return pending;
     };
@@ -181,18 +181,20 @@ export default function (pi: ExtensionAPI) {
               requestId: message.requestId,
               fileId: message.fileId,
               scope: message.scope,
+              commitSha: message.commitSha,
               message: "Unknown file requested.",
             });
             return;
           }
 
           try {
-            const contents = await loadContents(file, message.scope);
+            const contents = await loadContents(file, message.scope, message.commitSha);
             sendWindowMessage({
               type: "file-data",
               requestId: message.requestId,
               fileId: message.fileId,
               scope: message.scope,
+              commitSha: message.commitSha,
               originalContent: contents.originalContent,
               modifiedContent: contents.modifiedContent,
             });
@@ -203,6 +205,7 @@ export default function (pi: ExtensionAPI) {
               requestId: message.requestId,
               fileId: message.fileId,
               scope: message.scope,
+              commitSha: message.commitSha,
               message: messageText,
             });
           }
