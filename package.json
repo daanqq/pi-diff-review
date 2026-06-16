@@ -4,8 +4,7 @@
   "version": "0.2.0",
   "type": "module",
   "scripts": {
-    "check": "tsgo --noEmit",
-    "prepare": "husky"
+    "check": "tsgo --noEmit"
   },
   "pi": {
     "extensions": [
