@@ -1010,6 +1010,8 @@ function setupMonaco() {
       lineDecorationsWidth: 10,
       overviewRulerBorder: false,
       wordWrap: "on",
+      fontFamily: "'Iosevka Nerd Font', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace",
+      fontSize: 15,
     });
 
     createGlyphHoverActions(diffEditor.getOriginalEditor(), "original");

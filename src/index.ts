@@ -1,6 +1,6 @@
+import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
-import { open, type GlimpseWindow } from "glimpseui";
 import { getReviewWindowData, loadReviewFileContents } from "./git.js";
 import { composeReviewPrompt } from "./prompt.js";
 import type {
@@ -28,24 +28,28 @@ function isRequestFilePayload(value: ReviewWindowMessage): value is ReviewReques
 
 type WaitingEditorResult = "escape" | "window-settled";
 
-function escapeForInlineScript(value: string): string {
-  return value.replace(/</g, "\\u003c").replace(/>/g, "\\u003e").replace(/&/g, "\\u0026");
-}
-
 export default function (pi: ExtensionAPI) {
-  let activeWindow: GlimpseWindow | null = null;
+  let activeServer: Server | null = null;
+  let activePort: number | null = null;
+  let activeSseClients: Set<ServerResponse> = new Set();
   let activeWaitingUIDismiss: (() => void) | null = null;
 
-  function closeActiveWindow(): void {
-    if (activeWindow == null) return;
-    const windowToClose = activeWindow;
-    activeWindow = null;
+  function closeActiveServer(): void {
+    if (activeServer == null) return;
+    const server = activeServer;
+    activeServer = null;
+    activePort = null;
+    // close all SSE connections first
+    for (const res of activeSseClients) {
+      try { res.end(); } catch {}
+    }
+    activeSseClients.clear();
     try {
-      windowToClose.close();
+      server.close();
     } catch {}
   }
 
-  function showWaitingUI(ctx: ExtensionCommandContext): {
+  function showWaitingUI(ctx: ExtensionCommandContext, url: string): {
     promise: Promise<WaitingEditorResult>;
     dismiss: () => void;
   } {
@@ -80,9 +84,9 @@ export default function (pi: ExtensionAPI) {
           const borderTop = theme.fg("border", `╭${"─".repeat(innerWidth)}╮`);
           const borderBottom = theme.fg("border", `╰${"─".repeat(innerWidth)}╯`);
           const lines = [
-            theme.fg("accent", theme.bold("Waiting for review")),
-            "The native review window is open.",
-            "Press Escape to cancel and close the review window.",
+            theme.fg("accent", theme.bold("Review window ready")),
+            `Open in browser: ${url}`,
+            "Press Escape to cancel and close the review server.",
           ];
           return [
             borderTop,
@@ -111,9 +115,13 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
+  function sendSse(res: ServerResponse, data: string): void {
+    res.write(`data: ${data}\n\n`);
+  }
+
   async function reviewRepository(ctx: ExtensionCommandContext): Promise<void> {
-    if (activeWindow != null) {
-      ctx.ui.notify("A review window is already open.", "warning");
+    if (activeServer != null) {
+      ctx.ui.notify("A review server is already running.", "warning");
       return;
     }
 
@@ -124,22 +132,8 @@ export default function (pi: ExtensionAPI) {
     }
 
     const html = buildReviewHtml({ repoRoot, files, commits });
-    const window = open(html, {
-      width: 1680,
-      height: 1020,
-      title: "pi review",
-    });
-    activeWindow = window;
-
-    const waitingUI = showWaitingUI(ctx);
     const fileMap = new Map(files.map((file) => [file.id, file]));
     const contentCache = new Map<string, Promise<ReviewFileContents>>();
-
-    const sendWindowMessage = (message: ReviewHostMessage): void => {
-      if (activeWindow !== window) return;
-      const payload = escapeForInlineScript(JSON.stringify(message));
-      window.send(`window.__reviewReceive(${payload});`);
-    };
 
     const loadContents = (file: ReviewFile, scope: ReviewRequestFilePayload["scope"], commitSha?: string): Promise<ReviewFileContents> => {
       const cacheKey = `${scope}:${commitSha ?? ""}:${file.id}`;
@@ -151,100 +145,186 @@ export default function (pi: ExtensionAPI) {
       return pending;
     };
 
-    ctx.ui.notify("Opened native review window.", "info");
+    let reviewSettled = false;
+    let reviewResolve: ((value: ReviewSubmitPayload | ReviewCancelPayload | null) => void) | null = null;
+
+    const resolveReview = (value: ReviewSubmitPayload | ReviewCancelPayload | null): void => {
+      if (reviewSettled) return;
+      reviewSettled = true;
+      reviewResolve?.(value);
+    };
+
+    let handleRequestFile: ((message: ReviewRequestFilePayload) => Promise<void>) | null = null;
+
+    const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+      const url = req.url ?? "/";
+
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+      if (req.method === "OPTIONS") {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+
+      if (req.method === "GET" && (url === "/" || url === "/index.html")) {
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(html);
+        return;
+      }
+
+      if (req.method === "GET" && url === "/api/events") {
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+        });
+        res.flushHeaders();
+
+        activeSseClients.add(res);
+        sendSse(res, JSON.stringify({ type: "connected" }));
+
+        req.on("close", () => {
+          activeSseClients.delete(res);
+          // ponytail: cancel review when all browser tabs are closed
+          if (activeSseClients.size === 0) {
+            // small delay to let in-flight POST /api/message land first
+            setTimeout(() => {
+              if (activeSseClients.size === 0) resolveReview(null);
+            }, 500);
+          }
+        });
+        return;
+      }
+
+      if (req.method === "POST" && url === "/api/message") {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) {
+          chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+        }
+        const body = Buffer.concat(chunks).toString("utf8");
+        let message: ReviewWindowMessage;
+        try {
+          message = JSON.parse(body) as ReviewWindowMessage;
+        } catch {
+          res.writeHead(400);
+          res.end("Invalid JSON");
+          return;
+        }
+
+        res.writeHead(200);
+        res.end("ok");
+
+        if (isRequestFilePayload(message)) {
+          void handleRequestFile?.(message);
+        } else if (isSubmitPayload(message) || isCancelPayload(message)) {
+          resolveReview(message);
+        }
+        return;
+      }
+
+      res.writeHead(404);
+      res.end("Not found");
+    });
+
+    // Start server: try default port, fall back to next 10 ports if busy
+    const DEFAULT_PORT = 9876;
+    const MAX_ATTEMPTS = 10;
+    let listenPort = DEFAULT_PORT;
+    const startServer = (): Promise<void> => {
+      return new Promise((resolve, reject) => {
+        const tryListen = (attempt: number): void => {
+          server.listen(listenPort, "127.0.0.1", () => {
+            resolve();
+          });
+          server.once("error", (err: NodeJS.ErrnoException) => {
+            if (err.code === "EADDRINUSE" && attempt < MAX_ATTEMPTS) {
+              listenPort++;
+              tryListen(attempt + 1);
+            } else {
+              reject(err);
+            }
+          });
+        };
+        tryListen(0);
+      });
+    };
+    await startServer();
+
+    activeServer = server;
+    activePort = listenPort;
+    activeSseClients = new Set();
+
+    const url = `http://localhost:${listenPort}`;
+
+    // Try to open the browser automatically
+    const openCmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+    pi.exec(openCmd, [url], { cwd: ctx.cwd }).catch(() => null);
+
+    const waitingUI = showWaitingUI(ctx, url);
+
+    const broadcastWindowMessage = (message: ReviewHostMessage): void => {
+      const payload = JSON.stringify(message);
+      for (const client of activeSseClients) {
+        try { sendSse(client, payload); } catch {}
+      }
+    };
+
+    handleRequestFile = async (message: ReviewRequestFilePayload): Promise<void> => {
+      const file = fileMap.get(message.fileId);
+      if (file == null) {
+        broadcastWindowMessage({
+          type: "file-error",
+          requestId: message.requestId,
+          fileId: message.fileId,
+          scope: message.scope,
+          commitSha: message.commitSha,
+          message: "Unknown file requested.",
+        });
+        return;
+      }
+
+      try {
+        const contents = await loadContents(file, message.scope, message.commitSha);
+        broadcastWindowMessage({
+          type: "file-data",
+          requestId: message.requestId,
+          fileId: message.fileId,
+          scope: message.scope,
+          commitSha: message.commitSha,
+          originalContent: contents.originalContent,
+          modifiedContent: contents.modifiedContent,
+        });
+      } catch (error) {
+        const messageText = error instanceof Error ? error.message : String(error);
+        broadcastWindowMessage({
+          type: "file-error",
+          requestId: message.requestId,
+          fileId: message.fileId,
+          scope: message.scope,
+          commitSha: message.commitSha,
+          message: messageText,
+        });
+      }
+    };
+
+    const terminalMessagePromise = new Promise<ReviewSubmitPayload | ReviewCancelPayload | null>((resolve) => {
+      reviewResolve = resolve;
+    });
+
+    ctx.ui.notify(`Review server: ${url}`, "info");
 
     try {
-      const terminalMessagePromise = new Promise<ReviewSubmitPayload | ReviewCancelPayload | null>((resolve, reject) => {
-        let settled = false;
-
-        const cleanup = (): void => {
-          window.removeListener("message", onMessage);
-          window.removeListener("closed", onClosed);
-          window.removeListener("error", onError);
-          if (activeWindow === window) {
-            activeWindow = null;
-          }
-        };
-
-        const settle = (value: ReviewSubmitPayload | ReviewCancelPayload | null): void => {
-          if (settled) return;
-          settled = true;
-          cleanup();
-          resolve(value);
-        };
-
-        const handleRequestFile = async (message: ReviewRequestFilePayload): Promise<void> => {
-          const file = fileMap.get(message.fileId);
-          if (file == null) {
-            sendWindowMessage({
-              type: "file-error",
-              requestId: message.requestId,
-              fileId: message.fileId,
-              scope: message.scope,
-              commitSha: message.commitSha,
-              message: "Unknown file requested.",
-            });
-            return;
-          }
-
-          try {
-            const contents = await loadContents(file, message.scope, message.commitSha);
-            sendWindowMessage({
-              type: "file-data",
-              requestId: message.requestId,
-              fileId: message.fileId,
-              scope: message.scope,
-              commitSha: message.commitSha,
-              originalContent: contents.originalContent,
-              modifiedContent: contents.modifiedContent,
-            });
-          } catch (error) {
-            const messageText = error instanceof Error ? error.message : String(error);
-            sendWindowMessage({
-              type: "file-error",
-              requestId: message.requestId,
-              fileId: message.fileId,
-              scope: message.scope,
-              commitSha: message.commitSha,
-              message: messageText,
-            });
-          }
-        };
-
-        const onMessage = (data: unknown): void => {
-          const message = data as ReviewWindowMessage;
-          if (isRequestFilePayload(message)) {
-            void handleRequestFile(message);
-            return;
-          }
-          if (isSubmitPayload(message) || isCancelPayload(message)) {
-            settle(message);
-          }
-        };
-
-        const onClosed = (): void => {
-          settle(null);
-        };
-
-        const onError = (error: Error): void => {
-          if (settled) return;
-          settled = true;
-          cleanup();
-          reject(error);
-        };
-
-        window.on("message", onMessage);
-        window.on("closed", onClosed);
-        window.on("error", onError);
-      });
-
       const result = await Promise.race([
         terminalMessagePromise.then((message) => ({ type: "window" as const, message })),
         waitingUI.promise.then((reason) => ({ type: "ui" as const, reason })),
       ]);
 
       if (result.type === "ui" && result.reason === "escape") {
-        closeActiveWindow();
+        resolveReview(null);
+        closeActiveServer();
         await terminalMessagePromise.catch(() => null);
         ctx.ui.notify("Review cancelled.", "info");
         return;
@@ -254,7 +334,7 @@ export default function (pi: ExtensionAPI) {
 
       waitingUI.dismiss();
       await waitingUI.promise;
-      closeActiveWindow();
+      closeActiveServer();
 
       if (message == null || message.type === "cancel") {
         ctx.ui.notify("Review cancelled.", "info");
@@ -266,14 +346,14 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify("Inserted review feedback into the editor.", "info");
     } catch (error) {
       activeWaitingUIDismiss?.();
-      closeActiveWindow();
+      closeActiveServer();
       const message = error instanceof Error ? error.message : String(error);
       ctx.ui.notify(`Review failed: ${message}`, "error");
     }
   }
 
   pi.registerCommand("diff-review", {
-    description: "Open a native review window with git diff, last commit, and all files scopes",
+    description: "Open a browser review window with git diff, last commit, and all files scopes",
     handler: async (_args, ctx) => {
       await reviewRepository(ctx);
     },
@@ -281,6 +361,6 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => {
     activeWaitingUIDismiss?.();
-    closeActiveWindow();
+    closeActiveServer();
   });
 }
