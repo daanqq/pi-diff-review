@@ -1,4 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
+import { readdir } from "node:fs/promises";
+import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { getReviewWindowData, loadReviewFileContents } from "./git.js";
@@ -27,6 +29,40 @@ function isRequestFilePayload(value: ReviewWindowMessage): value is ReviewReques
 }
 
 type WaitingEditorResult = "escape" | "window-settled";
+
+async function isGitRepository(pi: ExtensionAPI, cwd: string): Promise<boolean> {
+  const result = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd });
+  return result.code === 0;
+}
+
+async function findChildGitRepositories(pi: ExtensionAPI, cwd: string): Promise<string[]> {
+  const entries = await readdir(cwd, { withFileTypes: true });
+  const repos: string[] = [];
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const child = join(cwd, entry.name);
+    if (await isGitRepository(pi, child)) repos.push(entry.name);
+  }
+
+  return repos.sort((a, b) => a.localeCompare(b));
+}
+
+async function resolveReviewCwd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<string | null> {
+  if (await isGitRepository(pi, ctx.cwd)) return ctx.cwd;
+
+  const repos = await findChildGitRepositories(pi, ctx.cwd);
+  if (repos.length === 0) {
+    ctx.ui.notify("Not inside a git repository, and no child git repositories found.", "error");
+    return null;
+  }
+
+  const selected = repos.length === 1
+    ? repos[0]
+    : await ctx.ui.select("Choose repository to review", repos);
+
+  return selected == null ? null : join(ctx.cwd, selected);
+}
 
 export default function (pi: ExtensionAPI) {
   let activeServer: Server | null = null;
@@ -125,7 +161,10 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const { repoRoot, files, commits } = await getReviewWindowData(pi, ctx.cwd);
+    const reviewCwd = await resolveReviewCwd(pi, ctx);
+    if (reviewCwd == null) return;
+
+    const { repoRoot, files, commits } = await getReviewWindowData(pi, reviewCwd);
     if (files.length === 0) {
       ctx.ui.notify("No reviewable files found.", "info");
       return;
@@ -261,7 +300,7 @@ export default function (pi: ExtensionAPI) {
 
     // Try to open the browser automatically
     const openCmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
-    pi.exec(openCmd, [url], { cwd: ctx.cwd }).catch(() => null);
+    pi.exec(openCmd, [url], { cwd: repoRoot }).catch(() => null);
 
     const waitingUI = showWaitingUI(ctx, url);
 

@@ -983,6 +983,11 @@ function setupMonaco() {
   window.require(["vs/editor/editor.main"], function () {
     monacoApi = window.monaco;
 
+    const unusedDiagnosticCodes = [6133, 6138, 6192, 6196, 6198, 6199];
+    const tsLanguages = monacoApi.languages?.typescript;
+    tsLanguages?.typescriptDefaults.setDiagnosticsOptions({ diagnosticCodesToIgnore: unusedDiagnosticCodes });
+    tsLanguages?.javascriptDefaults.setDiagnosticsOptions({ diagnosticCodesToIgnore: unusedDiagnosticCodes });
+
     monacoApi.editor.defineTheme("review-dark", {
       base: "vs-dark",
       inherit: true,
