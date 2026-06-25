@@ -983,7 +983,7 @@ function setupMonaco() {
   window.require(["vs/editor/editor.main"], function () {
     monacoApi = window.monaco;
 
-    const ignoredDiagnosticCodes = [6133, 6138, 6192, 6196, 6198, 6199, 7027];
+    const ignoredDiagnosticCodes = [6133, 6138, 6192, 6196, 6198, 6199, 7027, 7028];
     const tsLanguages = monacoApi.languages?.typescript;
     tsLanguages?.typescriptDefaults.setDiagnosticsOptions({ diagnosticCodesToIgnore: ignoredDiagnosticCodes });
     tsLanguages?.javascriptDefaults.setDiagnosticsOptions({ diagnosticCodesToIgnore: ignoredDiagnosticCodes });
@@ -1016,7 +1016,7 @@ function setupMonaco() {
       overviewRulerBorder: false,
       wordWrap: "on",
       fontFamily: "'Iosevka Nerd Font', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace",
-      fontSize: 15,
+      fontSize: 16,
     });
 
     createGlyphHoverActions(diffEditor.getOriginalEditor(), "original");
