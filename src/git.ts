@@ -205,6 +205,24 @@ async function getWorkingTreeContent(repoRoot: string, path: string): Promise<st
   }
 }
 
+function stripJsonComments(value: string): string {
+  return value
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/.*$/gm, "$1")
+    .replace(/,\s*([}\]])/g, "$1");
+}
+
+async function loadTsCompilerOptions(repoRoot: string): Promise<Record<string, unknown> | null> {
+  try {
+    const tsconfig = JSON.parse(stripJsonComments(await readFile(join(repoRoot, "tsconfig.json"), "utf8"))) as { compilerOptions?: unknown };
+    return tsconfig.compilerOptions != null && typeof tsconfig.compilerOptions === "object"
+      ? tsconfig.compilerOptions as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 function isReviewableFilePath(path: string): boolean {
   const lowerPath = path.toLowerCase();
   const fileName = lowerPath.split("/").pop() ?? lowerPath;
@@ -270,9 +288,10 @@ function upsertSeed(seeds: Map<string, ReviewFileSeed>, key: string, create: () 
   return seed;
 }
 
-export async function getReviewWindowData(pi: ExtensionAPI, cwd: string): Promise<{ repoRoot: string; files: ReviewFile[]; commits: { sha: string; shortSha: string; subject: string }[] }> {
+export async function getReviewWindowData(pi: ExtensionAPI, cwd: string): Promise<{ repoRoot: string; files: ReviewFile[]; commits: { sha: string; shortSha: string; subject: string }[]; tsCompilerOptions: Record<string, unknown> | null }> {
   const repoRoot = await getRepoRoot(pi, cwd);
   const repositoryHasHead = await hasHead(pi, repoRoot);
+  const tsCompilerOptions = await loadTsCompilerOptions(repoRoot);
 
   const trackedDiffOutput = repositoryHasHead
     ? await runGit(pi, repoRoot, ["diff", "--find-renames", "-M", "--name-status", "HEAD", "--"])
@@ -371,7 +390,7 @@ export async function getReviewWindowData(pi: ExtensionAPI, cwd: string): Promis
     .map(createReviewFile)
     .sort(compareReviewFiles);
 
-  return { repoRoot, files, commits };
+  return { repoRoot, files, commits, tsCompilerOptions };
 }
 
 export async function loadReviewFileContents(pi: ExtensionAPI, repoRoot: string, file: ReviewFile, scope: ReviewScope, commitSha?: string): Promise<ReviewFileContents> {

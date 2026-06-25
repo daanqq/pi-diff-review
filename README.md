@@ -22,7 +22,7 @@ The command:
 4. shows a collapsible sidebar with fuzzy file search
 5. shows git status markers in the sidebar for changed files and untracked files
 6. lazy-loads file contents on demand as you switch files and scopes
-7. suppresses Monaco's noisy standalone diagnostics in the review window
+7. applies the reviewed repository's `tsconfig.json` compiler options to Monaco previews
 8. lets you draft comments on the original side, modified side, or whole file
 9. inserts the resulting feedback prompt into the pi editor when you submit
 

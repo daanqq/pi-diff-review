@@ -89,6 +89,27 @@ function inferLanguage(path) {
   return "plaintext";
 }
 
+function repoFilePath(path) {
+  const root = String(reviewData.repoRoot || "").replace(/[\\/]$/, "");
+  return `${root}/${String(path || "").replace(/^[\\/]/, "")}`;
+}
+
+function enumValue(enumObject, value) {
+  if (!enumObject || typeof value !== "string") return value;
+  return enumObject[value] ?? enumObject[value.toUpperCase()] ?? value;
+}
+
+function monacoCompilerOptions(options) {
+  if (!options || typeof options !== "object") return {};
+  const ts = monacoApi.languages.typescript;
+  const mapped = { ...options };
+  mapped.target = enumValue(ts.ScriptTarget, mapped.target);
+  mapped.module = enumValue(ts.ModuleKind, mapped.module);
+  mapped.moduleResolution = enumValue(ts.ModuleResolutionKind, mapped.moduleResolution);
+  mapped.jsx = enumValue(ts.JsxEmit, mapped.jsx);
+  return mapped;
+}
+
 function scopeLabel(scope) {
   switch (scope) {
     case "git-diff": return "Git diff";
@@ -177,6 +198,17 @@ function activeFileShowsDiff() {
 function getScopeFilePath(file) {
   const comparison = getScopeComparison(file, state.currentScope);
   return comparison?.newPath || comparison?.oldPath || file?.path || "";
+}
+
+function getScopeSidePath(file, side) {
+  const comparison = getScopeComparison(file, state.currentScope);
+  if (side === "original") return comparison?.oldPath || file?.path || "";
+  return comparison?.newPath || file?.path || "";
+}
+
+function createFileModel(content, language, path, side) {
+  const uri = monacoApi.Uri.file(repoFilePath(path || "preview.txt")).with({ query: side });
+  return monacoApi.editor.createModel(content, language, uri);
 }
 
 function getScopeDisplayPath(file, scope = state.currentScope) {
@@ -812,8 +844,8 @@ function mountFile(options = {}) {
     clearViewZones();
     if (originalModel) originalModel.dispose();
     if (modifiedModel) modifiedModel.dispose();
-    originalModel = monacoApi.editor.createModel("", "plaintext");
-    modifiedModel = monacoApi.editor.createModel("", "plaintext");
+    originalModel = createFileModel("", "plaintext", "preview.txt", "original");
+    modifiedModel = createFileModel("", "plaintext", "modified-preview.txt", "modified");
     diffEditor.setModel({ original: originalModel, modified: modifiedModel });
     applyEditorOptions();
     updateDecorations();
@@ -835,8 +867,8 @@ function mountFile(options = {}) {
   if (originalModel) originalModel.dispose();
   if (modifiedModel) modifiedModel.dispose();
 
-  originalModel = monacoApi.editor.createModel(contents.originalContent, language);
-  modifiedModel = monacoApi.editor.createModel(contents.modifiedContent, language);
+  originalModel = createFileModel(contents.originalContent, language, getScopeSidePath(file, "original"), "original");
+  modifiedModel = createFileModel(contents.modifiedContent, language, getScopeSidePath(file, "modified"), "modified");
 
   diffEditor.setModel({ original: originalModel, modified: modifiedModel });
   applyEditorOptions();
@@ -983,10 +1015,10 @@ function setupMonaco() {
   window.require(["vs/editor/editor.main"], function () {
     monacoApi = window.monaco;
 
-    const ignoredDiagnosticCodes = [6133, 6138, 6192, 6196, 6198, 6199, 7027, 7028];
     const tsLanguages = monacoApi.languages?.typescript;
-    tsLanguages?.typescriptDefaults.setDiagnosticsOptions({ diagnosticCodesToIgnore: ignoredDiagnosticCodes });
-    tsLanguages?.javascriptDefaults.setDiagnosticsOptions({ diagnosticCodesToIgnore: ignoredDiagnosticCodes });
+    const compilerOptions = monacoCompilerOptions(reviewData.tsCompilerOptions);
+    tsLanguages?.typescriptDefaults.setCompilerOptions(compilerOptions);
+    tsLanguages?.javascriptDefaults.setCompilerOptions(compilerOptions);
 
     monacoApi.editor.defineTheme("review-dark", {
       base: "vs-dark",

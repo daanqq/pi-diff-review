@@ -92,4 +92,5 @@ export interface ReviewWindowData {
   repoRoot: string;
   files: ReviewFile[];
   commits: ReviewCommit[];
+  tsCompilerOptions: Record<string, unknown> | null;
 }
